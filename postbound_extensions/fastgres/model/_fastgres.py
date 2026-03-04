@@ -11,7 +11,7 @@ from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
 from sklearn.ensemble import GradientBoostingClassifier
 
-from .._util import load_json, save_json
+from .._util import load_json, save_json, prepare_dir
 from ..context import Context, ContextFactory
 from ..context import ContextManager
 from ..context import DatabaseSchema
@@ -99,9 +99,10 @@ class FastgresContextModel:
         wl_queries = workload.queries()
         ctx2q, q2ctx = self.cm.classify_queries(wl_queries)
         for context, query_set in ctx2q.items():
-            query_set = sorted(query_set)
-            ctx_train_x = self.featurizer.transform(query_set)
-            ctx_train_y = self.label_provider.get_labels([workload.label_of(q) for q in query_set])
+            sorted_labels = sorted([workload.label_of(q) for q in query_set])
+            sorted_queries = [workload[qn] for qn in sorted_labels]
+            ctx_train_x = self.featurizer.transform(sorted_queries)
+            ctx_train_y = self.label_provider.get_labels(sorted_labels)
             if len(ctx_train_y) < 2:
                 self._models[context] = self.IntegerModel()
             model = self.create_model(context)
@@ -127,7 +128,8 @@ class FastgresContextModel:
         for context, model in self._models.items():
             ctx_hash = str(hash(context))
             context_path = path / ctx_hash
-            context_path.mkdir(parents=True, exist_ok=True)
+            # context_path.mkdir(parents=True, exist_ok=True)
+            prepare_dir(context_path)
             if isinstance(model, self.IntegerModel):
                 model.save(context_path / "model.json")
                 manifest[ctx_hash] = {"schema": context.schema.to_dict(), "ctx_type": context.type, "type": "json"}
