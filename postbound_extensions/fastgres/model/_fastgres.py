@@ -16,8 +16,6 @@ from ..context import Context, ContextFactory
 from ..context import ContextManager
 from ..context import DatabaseSchema
 from ..featurization import FastgresFeaturization
-# from ._base import BaseModel
-# from ._context_base import ContextModel
 from ..labeling import FastgresLabelProvider
 
 
@@ -106,8 +104,8 @@ class FastgresContextModel:
             if len(ctx_train_y) < 2:
                 self._models[context] = self.IntegerModel()
             model = self.create_model(context)
-            self._models[context] = model
             model.fit(ctx_train_x, ctx_train_y)
+            self._models[context] = model
 
     def predict(self, query: pb.SqlQuery) -> Any:
         context = self.cm[query]

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Iterable, Sequence, Collection
 
+import numpy as np
 import pandas as pd
 import postbound as pb
 from bidict import bidict
@@ -43,11 +44,11 @@ class FastgresLabelProvider:
     def get_label(self, query_name: str) -> int:
         return self._dict[query_name]
 
-    def get_labels(self, query_names: Sequence[str]) -> Collection[int]:
+    def get_labels(self, query_names: Sequence[str]) -> np.ndarray:
         labels = list()
         for query_name in query_names:
             labels.append(self._dict[query_name])
-        return labels
+        return np.asarray(labels)
 
 
 ExperienceStore = dict[int, HintSetStats]
