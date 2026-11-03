@@ -56,27 +56,154 @@ def _traverse_query_plan(
         yield from _traverse_query_plan(node.input_node)
 
 
+def _scrub_query(query: pb.qal.SelectStatement) -> pb.qal.SelectStatement:
+    renamings = {tab: tab.drop_alias() for tab in query.tables()}
+    return pb.transform.rename_table(query, renamings)
+
+
+def _scrub_predicate(predicate: pb.qal.AbstractPredicate) -> pb.qal.AbstractPredicate:
+    renamings = {col: col.drop_table_alias() for col in predicate.columns()}
+    return pb.transform.rename_columns_in_predicate(predicate, renamings)
+
+
+def _scrub_join_tree(join_tree: pb.JoinTree) -> pb.JoinTree:
+    if join_tree.is_scan():
+        scrubbed = join_tree.base_table.drop_alias()
+        return pb.JoinTree.create_scan(scrubbed)
+
+    scrubbed_outer = _scrub_join_tree(join_tree.outer_child)
+    scrubbed_inner = _scrub_join_tree(join_tree.inner_child)
+    if len(scrubbed_inner.tables()) > len(scrubbed_outer.tables()):
+        scrubbed_outer, scrubbed_inner = scrubbed_inner, scrubbed_outer
+
+    return pb.JoinTree.create_join(scrubbed_outer, scrubbed_inner)
+
+
+def _scrub_query_plan(plan: pb.QueryPlan) -> pb.QueryPlan:
+    if plan.is_scan():
+        assert plan.base_table is not None
+        scrubbed = plan.base_table.drop_alias()
+        return pb.QueryPlan(
+            plan.node_type,
+            base_table=scrubbed,
+            estimates=plan.estimates,
+            measures=plan.measures,
+        )
+
+    if plan.is_join():
+        assert plan.outer_child is not None and plan.inner_child is not None
+        scrubbed_outer = _scrub_query_plan(plan.outer_child)
+        scrubbed_inner = _scrub_query_plan(plan.inner_child)
+
+        if len(scrubbed_inner.tables()) > len(scrubbed_outer.tables()):
+            scrubbed_outer, scrubbed_inner = scrubbed_inner, scrubbed_outer
+
+        return pb.QueryPlan(
+            plan.node_type,
+            children=[scrubbed_outer, scrubbed_inner],
+            estimates=plan.estimates,
+            measures=plan.measures,
+        )
+
+    assert plan.input_node is not None
+    scrubbed_input = _scrub_query_plan(plan.input_node)
+    return pb.QueryPlan(
+        plan.node_type,
+        children=[scrubbed_input],
+        estimates=plan.estimates,
+        measures=plan.measures,
+    )
+
+
+def _reorient_join_tree(join_tree: pb.JoinTree) -> pb.JoinTree:
+    if join_tree.is_scan():
+        return join_tree
+
+    outer = _reorient_join_tree(join_tree.outer_child)
+    inner = _reorient_join_tree(join_tree.inner_child)
+
+    n_outer, n_inner = len(outer.tables()), len(inner.tables())
+    if n_inner > n_outer:
+        outer, inner = inner, outer
+    elif n_inner == n_outer:
+        # deterministic tie-break
+        outer_tabs = sorted(outer.tables())
+        inner_tabs = sorted(inner.tables())
+        if inner_tabs < outer_tabs:
+            outer, inner = inner, outer
+
+    return pb.JoinTree.create_join(outer, inner)
+
+
+def _reorient_query_plan(plan: pb.QueryPlan) -> pb.QueryPlan:
+    if plan.is_scan():
+        return plan
+
+    if plan.is_join():
+        assert plan.outer_child is not None and plan.inner_child is not None
+        outer = _reorient_query_plan(plan.outer_child)
+        inner = _reorient_query_plan(plan.inner_child)
+
+        n_outer, n_inner = len(outer.tables()), len(inner.tables())
+
+        if n_inner > n_outer:
+            outer, inner = inner, outer
+        elif n_inner == n_outer:
+            # deterministic tie-break
+            outer_tabs = sorted(outer.tables())
+            inner_tabs = sorted(inner.tables())
+            if inner_tabs < outer_tabs:
+                outer, inner = inner, outer
+
+        return pb.QueryPlan(
+            plan.node_type,
+            operator=plan.operator,
+            children=[outer, inner],
+            plan_params=plan.params,
+            estimates=plan.estimates,
+            measures=plan.measures,
+            subplan=plan.subplan,
+        )
+
+    assert plan.input_node is not None
+    input_node = _reorient_query_plan(plan.input_node)
+    return pb.QueryPlan(
+        plan.node_type,
+        operator=plan.operator,
+        children=[input_node],
+        plan_params=plan.params,
+        estimates=plan.estimates,
+        measures=plan.measures,
+        subplan=plan.subplan,
+    )
+
+
 class QepsIdentifier:
     @staticmethod
     def empty() -> QepsIdentifier:
-        return QepsIdentifier([])
+        return QepsIdentifier([], additional=[])
 
-    def __init__(self, intermediate: Iterable[pb.TableReference]) -> None:
+    @staticmethod
+    def base(intermediate: Iterable[pb.TableReference]) -> QepsIdentifier:
+        return QepsIdentifier(intermediate, additional=[])
+
+    def __init__(self, intermediate: Iterable[pb.TableReference], *, additional: Iterable[pb.TableReference]) -> None:
         self._identifier = frozenset(intermediate)
+        self._additional = frozenset(additional)
 
     @property
     def intermediate(self) -> frozenset[pb.TableReference]:
         return self._identifier
 
     def is_plain(self) -> bool:
-        return len(self._identifier) == 1
+        return len(self._additional) == 1
 
-    def combine_with(self, other: QepsIdentifier) -> QepsIdentifier:
+    def add_to(self, other: QepsIdentifier) -> QepsIdentifier:
         combined = self._identifier.union(other._identifier)
-        return QepsIdentifier(combined)
+        return QepsIdentifier(combined, additional=self.intermediate)
 
     def __json__(self) -> pb.util.jsondict:
-        return {"identifier": self._identifier}
+        return {"identifier": self._identifier, "additional": self._additional}
 
     def __hash__(self) -> int:
         return hash(self._identifier)
@@ -97,26 +224,34 @@ class FilterAwareQepsIdentifier(QepsIdentifier):
     @staticmethod
     def infer(intermediate: Iterable[pb.TableReference], *, query: pb.qal.SelectStatement) -> FilterAwareQepsIdentifier:
         subquery = pb.transform.extract_subquery(query, intermediate)
-        if len(subquery.tables()):
-            return FilterAwareQepsIdentifier(intermediate, None)
+        if not subquery.tables():
+            return FilterAwareQepsIdentifier(intermediate, None, additional=[])
 
         filter_pred = subquery.where_clause.root if subquery.where_clause else None
-        return FilterAwareQepsIdentifier(intermediate, filter_pred)
+        return FilterAwareQepsIdentifier(intermediate, filter_pred, additional=[])
+
+    @staticmethod
+    def base(
+        intermediate: Iterable[pb.TableReference], filter_pred: pb.qal.AbstractPredicate | None = None
+    ) -> FilterAwareQepsIdentifier:
+        return FilterAwareQepsIdentifier(intermediate, filter_pred, additional=[])
 
     def __init__(
         self,
         intermediate: Iterable[pb.TableReference],
         filter_pred: pb.qal.AbstractPredicate | None,
+        *,
+        additional: Iterable[pb.TableReference],
     ) -> None:
-        super().__init__(intermediate)
+        super().__init__(intermediate, additional=additional)
         self._filter_pred = filter_pred
 
-    def combine_with(self, other: QepsIdentifier) -> FilterAwareQepsIdentifier:
+    def add_to(self, other: QepsIdentifier) -> FilterAwareQepsIdentifier:
         combined = self._identifier.union(other._identifier)
-        return FilterAwareQepsIdentifier(combined, self._filter_pred)
+        return FilterAwareQepsIdentifier(combined, self._filter_pred, additional=self.intermediate)
 
     def __json__(self) -> pb.util.jsondict:
-        return {"identifier": self._identifier, "filter": self._filter_pred}
+        return {"identifier": self._identifier, "filter": self._filter_pred, "additional": self._additional}
 
     def __hash__(self) -> int:
         return hash((self._identifier, self._filter_pred))
@@ -142,12 +277,16 @@ def load_qeps_id_json(
     """
     json_data = json.loads(json_data) if isinstance(json_data, str) else json_data
     identifier = [pb.parser.load_table_json(raw) for raw in json_data["identifier"]]
-    raw_filter = json_data.get("filter")
-    if raw_filter is None:
-        return QepsIdentifier(identifier)
+    additional = [pb.parser.load_table_json(raw) for raw in json_data.get("additional", [])]
 
+    # We cannot simply do json_data.get("filter") here, b/c a None value is also used if the the QEPS ID is
+    # filter-aware, but the current ID does not have a filter. Duplicate checks or Python 3.15 sentinel are required.
+    if "filter" not in json_data:
+        return QepsIdentifier(identifier, additional=additional)
+
+    raw_filter = json_data.get("filter")
     filter_pred = pb.parser.load_predicate_json(raw_filter)
-    return FilterAwareQepsIdentifier(identifier, filter_pred)
+    return FilterAwareQepsIdentifier(identifier, filter_pred, additional=additional)
 
 
 class QepsNode(ABC):
@@ -210,9 +349,9 @@ class PlainQeps(QepsNode):
         query: pb.qal.SelectStatement | None,
     ) -> QepsNode:
         child_identifier = (
-            QepsIdentifier(intermediate).combine_with(self._identifier)
+            QepsIdentifier.base(intermediate).add_to(self._identifier)
             if query is None
-            else FilterAwareQepsIdentifier.infer(intermediate, query=query).combine_with(self._identifier)
+            else FilterAwareQepsIdentifier.infer(intermediate, query=query).add_to(self._identifier)
         )
         child = self._children.get(child_identifier)
         if child is not None:
@@ -237,7 +376,6 @@ class PlainQeps(QepsNode):
             return
 
         best_op = pb.util.argmin(self._cost_summary)
-        print(self._identifier, "::", self._cost_summary)
         current_recommendation.add(best_op, self._identifier.intermediate)
 
     def feedback(
@@ -258,9 +396,9 @@ class PlainQeps(QepsNode):
     def __json__(self) -> pb.util.jsondict:
         return {
             "identifier": self._identifier,
-            "cost_summary": self._cost_summary,
+            "cost_summary": [{"operator": op, "cost": cost} for op, cost in self._cost_summary.items()],
             "gamma": self._gamma,
-            "children": self._children,
+            "children": list(self._children.values()),
         }
 
 
@@ -284,9 +422,9 @@ class SubqueryQeps(QepsNode):
         query: pb.qal.SelectStatement | None,
     ) -> QepsNode:
         child_identifier = (
-            QepsIdentifier(intermediate).combine_with(self._identifier)
+            QepsIdentifier.base(intermediate).add_to(self._identifier)
             if query is None
-            else FilterAwareQepsIdentifier.infer(intermediate, query=query).combine_with(self._identifier)
+            else FilterAwareQepsIdentifier.infer(intermediate, query=query).add_to(self._identifier)
         )
         child = self._children.get(child_identifier)
         if child is not None:
@@ -351,10 +489,10 @@ class SubqueryQeps(QepsNode):
     def __json__(self) -> pb.util.jsondict:
         return {
             "identifier": self._identifier,
-            "cost_summary": self._cost_summary,
+            "cost_summary": [{"operator": op, "cost": cost} for op, cost in self._cost_summary.items()],
             "gamma": self._gamma,
             "subquery": self._subquery_root,
-            "children": self._children,
+            "children": list(self._children.values()),
         }
 
 
@@ -366,7 +504,10 @@ def load_qeps_json(json_data: str | dict) -> QepsNode:
     json_data = json.loads(json_data) if isinstance(json_data, str) else json_data
     identifier = load_qeps_id_json(json_data["identifier"])
     gamma = json_data["gamma"]
-    cost_summary = {pb.opt.read_operator_json(k): v for k, v in json_data["cost_summary"].items()}
+    cost_summary = {
+        pb.opt.read_operator_json(summary_json["operator"]): summary_json["cost"]
+        for summary_json in json_data["cost_summary"]
+    }
     if any(not isinstance(op, pb.JoinOperator) for op in cost_summary):
         raise ValueError("Cost summary contains non-join operators.")
 
@@ -420,53 +561,6 @@ def load_tonic_json(json_data: str | dict, *, database: pb.Database) -> TonicOpe
     tonic._qeps = qeps  # type: ignore -- guarded by isinstance check above
 
     return tonic
-
-
-def _scrub_query(query: pb.qal.SelectStatement) -> pb.qal.SelectStatement:
-    renamings = {tab: tab.drop_alias() for tab in query.tables()}
-    return pb.transform.rename_table(query, renamings)
-
-
-def _scrub_join_tree(join_tree: pb.JoinTree) -> pb.JoinTree:
-    if join_tree.is_scan():
-        scrubbed = join_tree.base_table.drop_alias()
-        return pb.JoinTree.create_scan(scrubbed)
-
-    scrubbed_outer = _scrub_join_tree(join_tree.outer_child)
-    scrubbed_inner = _scrub_join_tree(join_tree.inner_child)
-    return pb.JoinTree.create_join(scrubbed_outer, scrubbed_inner)
-
-
-def _scrub_query_plan(plan: pb.QueryPlan) -> pb.QueryPlan:
-    if plan.is_scan():
-        assert plan.base_table is not None
-        scrubbed = plan.base_table.drop_alias()
-        return pb.QueryPlan(
-            plan.node_type,
-            base_table=scrubbed,
-            estimates=plan.estimates,
-            measures=plan.measures,
-        )
-
-    if plan.is_join():
-        assert plan.outer_child is not None and plan.inner_child is not None
-        scrubbed_outer = _scrub_query_plan(plan.outer_child)
-        scrubbed_inner = _scrub_query_plan(plan.inner_child)
-        return pb.QueryPlan(
-            plan.node_type,
-            children=[scrubbed_outer, scrubbed_inner],
-            estimates=plan.estimates,
-            measures=plan.measures,
-        )
-
-    assert plan.input_node is not None
-    scrubbed_input = _scrub_query_plan(plan.input_node)
-    return pb.QueryPlan(
-        plan.node_type,
-        children=[scrubbed_input],
-        estimates=plan.estimates,
-        measures=plan.measures,
-    )
 
 
 class TonicOperators(pb.OperatorSelection):
@@ -550,6 +644,7 @@ class TonicOperators(pb.OperatorSelection):
             raise pb.qal.QueryTypeError.expected_select(query)
 
         join_order = join_order or self._fallback_native_join_order(query)
+        join_order = _reorient_join_tree(join_order)
         assignment = pb.PhysicalOperatorAssignment()
 
         query_ctx = query if self._filter_aware else None
@@ -592,6 +687,7 @@ class TonicOperators(pb.OperatorSelection):
             case _:
                 raise ValueError(f"Invalid prediction target: {self._prediction_target}. ")
 
+        plan = _reorient_query_plan(plan)
         for inner_node, join_node in _traverse_query_plan(plan):
             current_qeps = current_qeps.follow(inner_node.tables(), query=query_ctx)
             if join_node is None:

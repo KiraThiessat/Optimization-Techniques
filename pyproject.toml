@@ -55,3 +55,6 @@ extend-immutable-calls = [
     "postbound_extensions.mscn._estimator.MscnHyperParams.default",
     "postbound.Cardinality.unknown",
 ]
+
+[tool.uv.sources]
+postbound = { git = "https://github.com/Optimizer-Playground/PostBound.git", rev = "b122d612f74e577210e4787bffc47019f03332eb" }
