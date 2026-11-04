@@ -24,11 +24,7 @@ def distinct_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
     from_clause = pb.qal.From.create_for(table)
     orderby_clause = pb.qal.OrderBy.create_for(col)
 
-    return pb.qal.ImplicitSqlQuery(
-        select_clause=select_clause,
-        from_clause=from_clause,
-        orderby_clause=orderby_clause,
-    )
+    return pb.qal.as_query(select_clause, from_clause, orderby_clause)
 
 
 def min_max_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
@@ -38,15 +34,10 @@ def min_max_values_query(col: pb.ColumnReference) -> pb.SqlQuery:
 
     min_col = pb.qal.FunctionExpression.create_min(col)
     max_col = pb.qal.FunctionExpression.create_max(col)
-    select_clause = pb.qal.Select(
-        [pb.qal.BaseProjection(min_col), pb.qal.BaseProjection(max_col)]
-    )
+    select_clause = pb.qal.Select([pb.qal.Projection(min_col), pb.qal.Projection(max_col)])
     from_clause = pb.qal.From.create_for(table)
 
-    return pb.qal.ImplicitSqlQuery(
-        select_clause=select_clause,
-        from_clause=from_clause,
-    )
+    return pb.qal.as_query(select_clause, from_clause)
 
 
 def wrap_logger(logger: bool | pb.util.Logger) -> pb.util.Logger:
@@ -101,15 +92,43 @@ class PandasDataset(Dataset):
     def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx: int):
-        return list(self.df.iloc[idx])
+    def __getitem__(self, index: int):
+        return list(self.df.iloc[index])
 
 
 def _noop_parser[T](value: T) -> T:
     return value
 
 
-def _date_parser(d: str) -> date:
+def _int_parser(value: int | str) -> int | None:
+    match value:
+        case "null":
+            return None
+        case int():
+            return value
+        case _:
+            return int(value)
+
+
+def _float_parser(value: float | str) -> float | None:
+    match value:
+        case "null":
+            return None
+        case float():
+            return value
+        case _:
+            return float(value)
+
+
+def _timestamp_parser(ts: str) -> datetime | None:
+    if ts == "null":
+        return None
+    return datetime.fromisoformat(ts)
+
+
+def _date_parser(d: str) -> date | None:
+    if d == "null":
+        return None
     return datetime.fromisoformat(d).date()
 
 
@@ -119,12 +138,17 @@ def make_json_parser(column_dtype: str) -> Callable[[Any], Any]:
     This functions as the inverse to PostBOUND's ``to_json()` utilitiy.
     """
 
+    column_dtype = column_dtype.lower()
     match column_dtype:
-        case "timestamp with time zone" | "timestamp without time zone":
-            return datetime.fromisoformat
+        case "timestamp" | "timestamp with time zone" | "timestamp without time zone":
+            return _timestamp_parser
         case "date":
             return _date_parser
-        case "varchar" | "text" | "integer":
+        case "integer" | "bigint" | "smallint":
+            return _int_parser
+        case "float" | "double precision" | "real":
+            return _float_parser
+        case "varchar" | "character varying" | "text":
             return _noop_parser
         case _:
             raise ValueError(f"Missing JSON parser for column type {column_dtype}")

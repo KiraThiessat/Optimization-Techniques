@@ -218,15 +218,24 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# MacOS
+.DS_Store
+
 # Project-specific stuff
 localtest*
 .pg-connect*.toml
-*.prof
 .query_cache*.json
-models/
+*.duckdb
 
+/generated/
+/models/
+/results/
+/workloads/
+
+*.prof
+
+# FASTgres stuff
 /tests/
 /queries/
 /postbound_extensions/fastgres/generated/
 /.idea
-requirements.txt

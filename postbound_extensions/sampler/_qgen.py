@@ -5,21 +5,22 @@ from __future__ import annotations
 import collections
 import itertools
 import random
+from collections import Counter
 from collections.abc import Generator, Iterable, Mapping, Sequence
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import networkx as nx
 import postbound as pb
 
-_NullOps = [pb.qal.LogicalOperator.Is, pb.qal.LogicalOperator.IsNot]
+_NullOps = [pb.qal.UnaryOperator.IsNull, pb.qal.UnaryOperator.IsNotNull]
 
 
-def _like_op(op: pb.qal.LogicalOperator) -> bool:
+def _like_op(op: pb.qal.BinaryOperator) -> bool:
     return op in [
-        pb.qal.LogicalOperator.Like,
-        pb.qal.LogicalOperator.NotLike,
-        pb.qal.LogicalOperator.ILike,
-        pb.qal.LogicalOperator.NotILike,
+        pb.qal.BinaryOperator.Like,
+        pb.qal.BinaryOperator.NotLike,
+        pb.qal.BinaryOperator.ILike,
+        pb.qal.BinaryOperator.NotILike,
     ]
 
 
@@ -33,17 +34,17 @@ class _ColSpec:
         column: pb.BoundColumnReference,
         *,
         database: pb.Database,
-        operators: Optional[Sequence[pb.qal.LogicalOperator]] = None,
+        operators: Sequence[pb.qal.BinaryOperator] | None = None,
     ) -> _ColSpec:
         dtype = database.schema().datatype(column)
         is_text = _text_col(dtype)
         operators = operators or [
-            pb.qal.LogicalOperator.Equal,
-            pb.qal.LogicalOperator.Greater,
-            pb.qal.LogicalOperator.GreaterEqual,
-            pb.qal.LogicalOperator.Less,
-            pb.qal.LogicalOperator.LessEqual,
-            pb.qal.LogicalOperator.Like,
+            pb.qal.BinaryOperator.Equal,
+            pb.qal.BinaryOperator.Greater,
+            pb.qal.BinaryOperator.GreaterEqual,
+            pb.qal.BinaryOperator.Less,
+            pb.qal.BinaryOperator.LessEqual,
+            pb.qal.BinaryOperator.Like,
         ]
         if not is_text:
             operators = [op for op in operators if not _like_op(op)]
@@ -60,7 +61,7 @@ class _ColSpec:
         self,
         column: pb.BoundColumnReference,
         is_text: bool,
-        allowed_ops: Iterable[pb.qal.LogicalOperator],
+        allowed_ops: Iterable[pb.qal.BinaryOperator],
         value_selection: Literal["pick", "range", "sample"],
         values: list,
     ):
@@ -79,7 +80,7 @@ class _ColSpec:
         return self._is_text
 
     @property
-    def allowed_ops(self) -> Sequence[pb.qal.LogicalOperator]:
+    def allowed_ops(self) -> Sequence[pb.qal.BinaryOperator]:
         return self._allowed_ops
 
     @property
@@ -90,7 +91,7 @@ class _ColSpec:
     def values(self) -> list:
         return self._values
 
-    def add_op(self, op: pb.qal.LogicalOperator) -> None:
+    def add_op(self, op: pb.qal.BinaryOperator) -> None:
         if not self.is_text and _like_op(op):
             return
         if op not in self._allowed_ops:
@@ -103,16 +104,14 @@ class _TableSpec:
         table: pb.TableReference,
         *,
         database: pb.Database,
-        operators: Optional[Sequence[pb.qal.LogicalOperator]] = None,
+        operators: Sequence[pb.qal.BinaryOperator] | None = None,
     ) -> _TableSpec:
         filter_cols: Mapping[pb.ColumnReference, _ColSpec] = {}
         tab_info = database.schema()[table]
         for col_info in tab_info.columns:
             if col_info.indexed:
                 continue
-            filter_cols[col_info.column] = _ColSpec.full(
-                col_info.column, database=database, operators=operators
-            )
+            filter_cols[col_info.column] = _ColSpec.full(col_info.column, database=database, operators=operators)
         return _TableSpec(table=table, filter_columns=filter_cols)
 
     @staticmethod
@@ -133,13 +132,9 @@ class _TableSpec:
 
 class _PredicateCollector(pb.qal.PredicateVisitor[None]):
     def __init__(self):
-        self.column_filters: Mapping[
-            pb.BoundColumnReference, set[pb.qal.LogicalOperator]
-        ] = collections.defaultdict(set)
+        self.column_filters: Mapping[pb.BoundColumnReference, set[pb.qal.BinaryOperator]] = collections.defaultdict(set)
         self.joins: set[tuple[pb.BoundColumnReference, pb.BoundColumnReference]] = set()
-        self.filter_weights: collections.Counter[pb.BoundColumnReference] = (
-            collections.Counter()
-        )
+        self.filter_weights: collections.Counter[pb.BoundColumnReference] = collections.Counter()
 
     def visit_binary_predicate(self, predicate: pb.qal.BinaryPredicate) -> None:
         if predicate.is_filter():
@@ -162,8 +157,8 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
         # currently only select single values for the filter columns
         self.column_filters[col].update(
             [
-                pb.qal.LogicalOperator.LessEqual,
-                pb.qal.LogicalOperator.GreaterEqual,
+                pb.qal.BinaryOperator.LessEqual,
+                pb.qal.BinaryOperator.GreaterEqual,
             ]
         )
         self.filter_weights[col] += 1
@@ -180,7 +175,7 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
         # Similar to BETWEEN predicates, we don't include the actual IN predicate,
         # because our sampling logic can currently only select single values for the
         # filter columns. Instead, we treat IN predicates as equality predicates on the column.
-        self.column_filters[col].add(pb.qal.LogicalOperator.Equal)
+        self.column_filters[col].add(pb.qal.BinaryOperator.Equal)
         self.filter_weights[col] += 1
 
     def visit_unary_predicate(self, predicate: pb.qal.UnaryPredicate) -> None:
@@ -210,7 +205,7 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
             component.accept_visitor(self)
 
     def _visit_binary_filter(self, predicate: pb.qal.BinaryPredicate) -> None:
-        if not isinstance(predicate.operation, pb.qal.LogicalOperator):
+        if not isinstance(predicate.operator, pb.qal.BinaryOperator):
             return
         columns = predicate.columns()
         if len(columns) != 1:
@@ -220,7 +215,7 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
             return
 
         col = col.drop_table_alias()
-        self.column_filters[col].add(predicate.operation)
+        self.column_filters[col].add(predicate.operator)
         self.filter_weights[col] += 1
 
     def _visit_binary_join(self, predicate: pb.qal.BinaryPredicate) -> None:
@@ -228,10 +223,7 @@ class _PredicateCollector(pb.qal.PredicateVisitor[None]):
         if len(columns) != 2:
             return
         col1, col2 = columns
-        if (  #
-            not pb.ColumnReference.assert_bound(col1)  #
-            or not pb.ColumnReference.assert_bound(col2)
-        ):
+        if not pb.ColumnReference.assert_bound(col1) or not pb.ColumnReference.assert_bound(col2):
             return
         if col2 < col1:
             col1, col2 = col2, col1
@@ -245,8 +237,8 @@ class _SampleSpec:
     def full(
         database: pb.Database,
         *,
-        ignore_tables: Optional[set[pb.TableReference]] = None,
-        operators: Optional[Sequence[pb.qal.LogicalOperator]] = None,
+        ignore_tables: set[pb.TableReference] | None = None,
+        operators: Sequence[pb.qal.BinaryOperator] | None = None,
     ) -> _SampleSpec:
         schema = database.schema()
         ignore_tables = ignore_tables or set()
@@ -263,7 +255,10 @@ class _SampleSpec:
         for _, _, data in schema_graph.edges(data=True):
             fkeys: Sequence[pb.db.ForeignKeyRef] = data["foreign_keys"]
             for fkey in fkeys:
-                fk_col, ref_col = fkey.fk_col, fkey.referenced_col
+                if not fkey.is_simple():
+                    continue
+
+                fk_col, ref_col = fkey.simplify_fk_cols(), fkey.simplify_referenced_cols()
                 join_graph.add_edge(
                     fk_col.table,
                     ref_col.table,
@@ -286,13 +281,11 @@ class _SampleSpec:
         )
 
     @staticmethod
-    def derive_from_workload(
-        workload: pb.Workload, *, database: pb.Database
-    ) -> _SampleSpec:
+    def derive_from_workload(workload: pb.Workload, *, database: pb.Database) -> _SampleSpec:
         predicate_collector = _PredicateCollector()
         tables: set[pb.TableReference] = set()
-        min_tables, max_tables = float("inf"), 0
-        min_filters, max_filters = float("inf"), 0
+        min_tables, max_tables = 999_999, 0
+        min_filters, max_filters = 999_999, 0
         for query in workload.queries():
             predicate_collector.visit_query_predicates(query)
             tables.update(tab.drop_alias() for tab in query.tables())
@@ -324,7 +317,7 @@ class _SampleSpec:
                 table_specs[tab] = _TableSpec.empty(tab)
                 continue
 
-            filter_columns = {col.column: col for col in cols}
+            filter_columns: Mapping[pb.ColumnReference, _ColSpec] = {col.column: col for col in cols}
             table_specs[tab] = _TableSpec(table=tab, filter_columns=filter_columns)
 
         return _SampleSpec(
@@ -340,7 +333,7 @@ class _SampleSpec:
     def __init__(
         self,
         tables: Mapping[pb.TableReference, _TableSpec],
-        filter_weights: Mapping[pb.ColumnReference, int],
+        filter_weights: Mapping[pb.ColumnReference, int] | Counter[pb.BoundColumnReference],
         joins: nx.Graph,
         min_tables: int,
         max_tables: int,
@@ -363,9 +356,7 @@ class _SampleSpec:
     def n_filter_columns(self) -> int:
         return sum(len(tab_spec.filter_columns) for tab_spec in self.tables.values())
 
-    def filterable_cols_on(
-        self, tables: Sequence[pb.TableReference]
-    ) -> Sequence[pb.ColumnReference]:
+    def filterable_cols_on(self, tables: Sequence[pb.TableReference]) -> Sequence[pb.ColumnReference]:
         return pb.util.flatten(self.tables[tab].filter_columns.keys() for tab in tables)
 
     def __getitem__(self, key: pb.ColumnReference) -> _ColSpec:
@@ -412,7 +403,7 @@ def _draw_filter_cols(
 
 def _draw_filter_value(
     col: _ColSpec,
-    operator: pb.qal.LogicalOperator,
+    operator: pb.qal.BinaryOperator,
     *,
     database: pb.Database,
     retries: int = 3,
@@ -420,20 +411,16 @@ def _draw_filter_value(
     col_name, tab_name = col.column.name, col.column.table.full_name
 
     # Postgres and DuckDB provide specialized sampling facilities. Use them if possible.
-    if isinstance(database, pb.postgres.PostgresInterface):
+    if isinstance(database, pb.postgres.PostgresDatabase):
         # even though the BERNOUILLI sampling method would be "more uniform", we opt for SYSTEM sampling due to its much
         # lower execution time.
-        query_template = (
-            f"SELECT DISTINCT {col_name} FROM {tab_name} TABLESAMPLE SYSTEM(1)"
-        )
-    elif isinstance(database, pb.duckdb.DuckDBInterface):
-        query_template = (
-            f"SELECT DISTINCT {col_name} FROM {tab_name} USING SAMPLE 1 ROWS"
-        )
+        query_template = f"SELECT DISTINCT {col_name} FROM {tab_name} TABLESAMPLE SYSTEM(1)"
+    elif isinstance(database, pb.duckdb.DuckDBDatabase):
+        query_template = f"SELECT DISTINCT {col_name} FROM {tab_name} USING SAMPLE 1 ROWS"
     else:
         query_template = f"SELECT DISTINCT {col_name} FROM {tab_name}"
 
-    result_set = database.execute_query(query_template, cache_enabled=False, raw=True)
+    result_set = database.execute_query(query_template, raw=True)
     assert result_set is not None
     if not result_set and retries == 0:
         return (False, None)
@@ -449,9 +436,7 @@ def _draw_filter_value(
     return (True, value)
 
 
-def _draw_filter_pred(
-    col: _ColSpec, *, database: pb.Database
-) -> Optional[pb.qal.AbstractPredicate]:
+def _draw_filter_pred(col: _ColSpec, *, database: pb.Database) -> pb.qal.AbstractPredicate | None:
     operator = random.choice(col.allowed_ops)
 
     # LIKE operators can only be applied to text columns.
@@ -506,14 +491,14 @@ def _generate_join_predicates(
 
 
 def generate_query(
-    target_db: Optional[pb.Database],
+    target_db: pb.Database | None,
     *,
-    similar_to: Optional[pb.Workload] = None,
-    ignore_tables: Optional[set[pb.TableReference]] = None,
-    min_tables: Optional[int] = None,
-    max_tables: Optional[int] = None,
-    min_filters: Optional[int] = None,
-    max_filters: Optional[int] = None,
+    similar_to: pb.Workload | None = None,
+    ignore_tables: set[pb.TableReference] | None = None,
+    min_tables: int | None = None,
+    max_tables: int | None = None,
+    min_filters: int | None = None,
+    max_filters: int | None = None,
     count_star: bool = False,
 ) -> Generator[pb.SqlQuery, None, None]:
     """A simple randomized query generator.
@@ -603,9 +588,7 @@ def generate_query(
         if n_filters != len(filter_cols):
             continue
 
-        filter_preds = [
-            _draw_filter_pred(spec[col], database=target_db) for col in filter_cols
-        ]
+        filter_preds = [_draw_filter_pred(spec[col], database=target_db) for col in filter_cols]
         if any(pred is None for pred in filter_preds):
             continue
 
@@ -620,8 +603,8 @@ def generate_query(
         else:
             where_clause = None
 
-        from_clause = pb.qal.ImplicitFromClause.create_for(tables)
-        query = pb.qal.ImplicitSqlQuery(
+        from_clause = pb.qal.From.create_for(tables)
+        query = pb.qal.SelectStatement(
             select_clause=select_clause,
             from_clause=from_clause,
             where_clause=where_clause,

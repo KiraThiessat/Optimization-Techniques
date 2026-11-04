@@ -25,7 +25,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -66,8 +65,8 @@ class BinarizedQep:
 
     is_dummy: bool
     node: str
-    outer_child: Optional[BinarizedQep]
-    inner_child: Optional[BinarizedQep]
+    outer_child: BinarizedQep | None
+    inner_child: BinarizedQep | None
     cardinality: int
     cost: float
     cache_pct: float
@@ -90,12 +89,8 @@ class BinarizedQep:
 
         elif plan.is_join():
             assert plan.outer_child and plan.inner_child
-            binarized_outer = BinarizedQep.create_for(
-                plan.outer_child, cache_state=cache_state
-            )
-            binarized_inner = BinarizedQep.create_for(
-                plan.inner_child, cache_state=cache_state
-            )
+            binarized_outer = BinarizedQep.create_for(plan.outer_child, cache_state=cache_state)
+            binarized_inner = BinarizedQep.create_for(plan.inner_child, cache_state=cache_state)
             return BinarizedQep.pseudo_join(
                 plan.node_type,
                 binarized_outer,
@@ -108,9 +103,7 @@ class BinarizedQep:
         assert plan.input_node
 
         dummy_child = BinarizedQep.dummy()
-        binarized_input = BinarizedQep.create_for(
-            plan.input_node, cache_state=cache_state
-        )
+        binarized_input = BinarizedQep.create_for(plan.input_node, cache_state=cache_state)
         return BinarizedQep.pseudo_join(
             plan.node_type,
             binarized_input,
@@ -121,9 +114,7 @@ class BinarizedQep:
         )
 
     @staticmethod
-    def scan(
-        node: str, *, cardinality: int, cost: float, cache_pct: float
-    ) -> BinarizedQep:
+    def scan(node: str, *, cardinality: int, cost: float, cache_pct: float) -> BinarizedQep:
         """Transforms the scan node into its binarized equivalent."""
         return BinarizedQep(False, node, None, None, cardinality, cost, cache_pct)
 
@@ -145,12 +136,12 @@ class BinarizedQep:
         """Creates a dummy binarized node."""
         return BinarizedQep(True, "", None, None, -1, -1, 0)
 
-    def outer(self) -> Optional[BinarizedQep]:
+    def outer(self) -> BinarizedQep | None:
         # we need this method for the TCNN's flatten() method
         # functionally it is completely redundant.
         return self.outer_child
 
-    def inner(self) -> Optional[BinarizedQep]:
+    def inner(self) -> BinarizedQep | None:
         # we need this method for the TCNN's flatten() method
         # functionally it is completely redundant
         return self.inner_child
@@ -159,11 +150,7 @@ class BinarizedQep:
         return not self.is_dummy and self.outer_child is None
 
     def is_join(self) -> bool:
-        return (
-            self.outer_child is not None
-            and self.inner_child is not None
-            and not self.inner_child.is_dummy
-        )
+        return self.outer_child is not None and self.inner_child is not None and not self.inner_child.is_dummy
 
     def is_intermediate(self) -> bool:
         return self.inner_child is not None and self.inner_child.is_dummy
@@ -176,22 +163,20 @@ class NodeType(IntEnum):
     Dummy = 4
 
 
-FeaturizedNode = collections.namedtuple(
-    "FeaturizedNode", ["node_type", "encoding", "outer_child", "inner_child"]
-)
+FeaturizedNode = collections.namedtuple("FeaturizedNode", ["node_type", "encoding", "outer_child", "inner_child"])
 
 
 def node_features(node: FeaturizedNode) -> np.ndarray:
     return node.encoding
 
 
-def outer_child(node: FeaturizedNode) -> Optional[FeaturizedNode]:
+def outer_child(node: FeaturizedNode) -> FeaturizedNode | None:
     if node.node_type == NodeType.Dummy or node.node_type == NodeType.Scan:
         return None
     return node.outer_child
 
 
-def inner_child(node: FeaturizedNode) -> Optional[FeaturizedNode]:
+def inner_child(node: FeaturizedNode) -> FeaturizedNode | None:
     if node.node_type == NodeType.Dummy or node.node_type == NodeType.Scan:
         return None
     return node.inner_child
@@ -202,7 +187,7 @@ class DatabaseCacheState:
         self._db = database
         self._stats = self._db.statistics()
 
-        if isinstance(self._stats, pb.postgres.PostgresStatisticsInterface):
+        if isinstance(self._stats, pb.postgres.PostgresStatistics):
             self._cache_state = self._stats.buffer_state()
         else:
             self._cache_state = {}
@@ -217,7 +202,7 @@ class DatabaseCacheState:
 
             return measures.cache_hits / total_cache_accesses
 
-        if not isinstance(self._db, pb.postgres.PostgresInterface):
+        if not isinstance(self._db, pb.postgres.PostgresDatabase):
             return 0
 
         assert node.base_table
@@ -239,10 +224,10 @@ class DatabaseCacheState:
 
         pct_sum = 0
         for rel in rels:
-            total_pages = self._stats.n_pages(rel)
+            total_pages = self._stats.n_pages(rel)  # type: ignore - guarded by isinstance(PostgresInterface) above
             buffered_pages = self._cache_state.get(rel, -1)
             if buffered_pages == -1:
-                buffered_pages = self._stats.n_buffered(rel)
+                buffered_pages = self._stats.n_buffered(rel)  # type: ignore - guarded by isinstance(PostgresInterface) above
                 self._cache_state[rel] = buffered_pages
             pct_sum += buffered_pages / total_pages
 
@@ -293,9 +278,7 @@ class BaoFeaturizer:
     """
 
     @staticmethod
-    def online(
-        database: pb.Database, *, max_runtime_ms: float = 1000 * 60 * 60
-    ) -> BaoFeaturizer:
+    def online(database: pb.Database, *, max_runtime_ms: float = 1000 * 60 * 60) -> BaoFeaturizer:
         """Infers the featurization from the database.
 
         This featurization strategy trades off high generality for potentially larger
@@ -310,7 +293,7 @@ class BaoFeaturizer:
         largest tables in the schema.
         The maximum runtime can be specified by the user. As a default, we use one hour.
         """
-        operators = pb.postgres.PostgresExplainNode.all_node_types()
+        operators = pb.postgres.PostgresExplain.all_node_types()
 
         top_tables = queue.PriorityQueue(maxsize=3)
         for tab in database.schema().tables():
@@ -339,9 +322,7 @@ class BaoFeaturizer:
 
         select_clause = pb.qal.Select.count_star()
         from_clause = pb.qal.From.create_for(largest_tables)
-        cross_product = pb.qal.SqlQuery(
-            select_clause=select_clause, from_clause=from_clause
-        )
+        cross_product = pb.qal.as_query(select_clause, from_clause)
 
         max_cost = database.optimizer().cost_estimate(cross_product)
 
@@ -478,13 +459,19 @@ class BaoFeaturizer:
         self._min_runtime = min_runtime_ms
         self._max_runtime = max_runtime_ms
 
+        self._min_card_log = np.log(self._min_card)
+        self._max_card_log = np.log(self._max_card)
+        self._min_cost_log = np.log(self._min_cost)
+        self._max_cost_log = np.log(self._max_cost)
+        self._min_runtime_log = np.log(self._min_runtime)
+        self._max_runtime_log = np.log(self._max_runtime)
+
+        # beware of where to pass the log-scaled values and where we need the original ones!
         self._runtime_pipeline = make_pipeline(
             FunctionTransformer(func=np.log1p, inverse_func=np.expm1),
-            MinMaxScaler((self._min_runtime, self._max_runtime)),
+            MinMaxScaler((self._min_runtime_log, self._max_runtime_log)),
         )
-        self._runtime_pipeline.fit(
-            np.asarray([self._min_runtime, self._max_runtime]).reshape(-1, 1)
-        )
+        self._runtime_pipeline.fit(np.asarray([self._min_runtime, self._max_runtime]).reshape(-1, 1))
 
         self._db = database
 
@@ -545,16 +532,16 @@ class BaoFeaturizer:
         """Min-max scales the cardinality estimate of the node."""
         if node.is_dummy:
             return np.zeros(1)
-        scaled = np.log(node.cardinality + 1) - self._min_card
-        scaled /= self._max_card - self._min_card
+        scaled = np.log(node.cardinality + 1) - self._min_card_log
+        scaled /= self._max_card_log - self._min_card_log
         return np.asarray([scaled])
 
     def encode_cost(self, node: BinarizedQep) -> np.ndarray:
         """Min-max scales the cost estimate of the node."""
         if node.is_dummy:
             return np.zeros(1)
-        scaled = np.log(node.cost + 1) - self._min_cost
-        scaled /= self._max_cost - self._min_cost
+        scaled = np.log(node.cost + 1) - self._min_cost_log
+        scaled /= self._max_cost_log - self._min_cost_log
         return np.asarray([scaled])
 
     def encode_cache_pct(self, node: BinarizedQep) -> np.ndarray:

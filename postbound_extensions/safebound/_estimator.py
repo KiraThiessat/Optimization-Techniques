@@ -43,9 +43,13 @@ class SafeBoundEstimator(pb.CardinalityEstimator):
         query: pb.SqlQuery,
         intermediate: pb.TableReference | Iterable[pb.TableReference],
     ) -> pb.Cardinality:
-        subquery = pb.transform.extract_query_fragment(query, intermediate)
-        if subquery is None:
-            raise ValueError("No valid subquery found")
+        subquery = pb.transform.extract_subquery(query, intermediate)
+        if len(subquery.tables()) == 1:
+            return pb.Cardinality.unknown()
+
+        equi_join_check = pb.validation.EquiJoinPreCheck()
+        if not equi_join_check.check_supported_query(subquery).passed:
+            return pb.Cardinality.unknown()
 
         stats = self._catalog.retrieve_stats(subquery)
         return fdsb(subquery, statistics=stats)

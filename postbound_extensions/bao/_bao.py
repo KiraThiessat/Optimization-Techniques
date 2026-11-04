@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import functools
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import TypedDict
 
 import numpy as np
 import pandas as pd
@@ -447,9 +447,7 @@ def default_hint_sets() -> list[pb.PhysicalOperatorAssignment]:
     return arms
 
 
-class BaoOptimizer(
-    pb.CompleteOptimizationAlgorithm, pb.PhysicalOperatorSelection, pb.CostModel
-):
+class BaoOptimizer(pb.CompleteOptimizationAlgorithm, pb.OperatorSelection, pb.CostModel):
     """Bao is a learned query optimizer that uses hint sets to select optimal candidate plans.
 
     Bao sits on top of a native database system and steers its native optimizer with hint sets.
@@ -560,18 +558,13 @@ class BaoOptimizer(
             catalog = json.load(f)
 
         featurizer = BaoFeaturizer.pre_built(catalog["featurizer"], database=database)
-        experience = BaoExperience.load(
-            catalog["experience"]["catalog"], featurizer=featurizer
-        )
+        experience = BaoExperience.load(catalog["experience"]["catalog"], featurizer=featurizer)
 
         weights = torch.load(catalog["tcnn_model"])
         model = BaoModel(featurizer.out_shape)
         model.load_state_dict(weights)
 
-        hint_sets = [
-            pb.opt.read_operator_assignment_json(hints)
-            for hints in catalog["hint_sets"]
-        ]
+        hint_sets = [pb.opt.read_operator_assignment_json(hints) for hints in catalog["hint_sets"]]
 
         bao = BaoOptimizer(
             database,
@@ -645,10 +638,10 @@ class BaoOptimizer(
         self,
         target_db: pb.Database,
         *,
-        hint_sets: Optional[Iterable[pb.PhysicalOperatorAssignment]] = None,
-        tcnn: Optional[BaoModel] = None,
-        featurizer: Optional[BaoFeaturizer] = None,
-        experience: Optional[BaoExperience] = None,
+        hint_sets: Iterable[pb.PhysicalOperatorAssignment] | None = None,
+        tcnn: BaoModel | None = None,
+        featurizer: BaoFeaturizer | None = None,
+        experience: BaoExperience | None = None,
         retrain: bool = True,
         training_epochs: int = 100,
         experience_window: int = 2000,
@@ -657,9 +650,7 @@ class BaoOptimizer(
     ) -> None:
         super().__init__()
         self._db = target_db
-        self._hint_sets = (
-            list(hint_sets) if hint_sets is not None else default_hint_sets()
-        )
+        self._hint_sets = list(hint_sets) if hint_sets is not None else default_hint_sets()[:5]
         self._featurizer = featurizer or BaoFeaturizer.online(self._db)
         self._experience = experience or BaoExperience(
             self._featurizer,
@@ -689,10 +680,7 @@ class BaoOptimizer(
     def optimize_query(self, query: pb.SqlQuery) -> pb.QueryPlan:
         cache_state = DatabaseCacheState(self._db)
         plans = [self._generate_plan(query, hint_set) for hint_set in self._hint_sets]
-        featurized = [
-            self._featurizer.encode_plan(plan, cache_state=cache_state)
-            for plan in plans
-        ]
+        featurized = [self._featurizer.encode_plan(plan, cache_state=cache_state) for plan in plans]
 
         predictions = self._tcnn(featurized)
         idxmin = int(torch.argmin(predictions).item())
@@ -702,25 +690,17 @@ class BaoOptimizer(
         return plans[idxmin]
 
     def select_physical_operators(
-        self, query: pb.SqlQuery, join_order: Optional[pb.JoinTree]
+        self, query: pb.SqlQuery, join_order: pb.JoinTree | None
     ) -> pb.PhysicalOperatorAssignment:
         cache_state = DatabaseCacheState(self._db)
-        plans = [
-            self._generate_plan(query, hint_set, join_order=join_order)
-            for hint_set in self._hint_sets
-        ]
+        plans = [self._generate_plan(query, hint_set, join_order=join_order) for hint_set in self._hint_sets]
 
-        featurized = [
-            self._featurizer.encode_plan(plan, cache_state=cache_state)
-            for plan in plans
-        ]
+        featurized = [self._featurizer.encode_plan(plan, cache_state=cache_state) for plan in plans]
         predictions = self._tcnn(featurized)
 
         idxmin = int(torch.argmin(predictions).item())
         hint_set = self._hint_sets[idxmin]
-        self._log(
-            f"Selected arm {idxmin} ({_stringify_hint_set(hint_set)}) for query {query}"
-        )
+        self._log(f"Selected arm {idxmin} ({_stringify_hint_set(hint_set)}) for query {query}")
         return hint_set
 
     def estimate_cost(self, query: pb.SqlQuery, plan: pb.QueryPlan) -> pb.Cost:
@@ -729,9 +709,7 @@ class BaoOptimizer(
         prediction = self._tcnn([featurized])
         return prediction.item()
 
-    def add_experience(
-        self, plan: pb.QueryPlan, runtime_ms: float | None = None
-    ) -> None:
+    def add_experience(self, plan: pb.QueryPlan, runtime_ms: float | None = None) -> None:
         """Records a new experience sample, possibly triggering retraining.
 
         If the retraining threshold is reached, a new TCNN model is retrained (provided that it is
@@ -766,82 +744,99 @@ class BaoOptimizer(
         *,
         plan_column: str = "query_plan",
         runtime_column: str = "runtime_ms",
-        timeout_ms: Optional[float] = None,
+        timeout_ms: float | None = None,
         from_scratch: bool = False,
+        hint_sets: Callable[[str, pb.SqlQuery], Iterable[pb.PhysicalOperatorAssignment]] | None = None,
     ) -> None:
         """Performs a batch training of the TCNN.
 
-        This function operates in two different modes: If the workload is given as a set of queries,
-        these will be executed and their query plans and runtimes are gathered. In this mode, an
-        optional timeout can be supplied to skip very long running queries.
-        If the workload is instead given as a Pandas DataFrame, it is assumed that this workload
-        contains query plans and runtimes that have already been calculated in an offline training
-        phase (e.g., using the *query-sampler.py* tool).
+        This function operates in two different modes: If the workload is given
+        as a set of queries, these will be executed and for each hint set, their
+        query plans and runtimes are gathered. In this mode, an optional timeout
+        can be supplied to skip very long running queries.
+        If the workload is instead given as a Pandas DataFrame, it is assumed
+        that this workload contains query plans and runtimes that have already
+        been calculated in an offline training phase (e.g., using the
+        *query-sampler.py* tool).
 
-        Once all query plans have been gathered, the TCNN is trained. By default, the current model
-        weights are used as a starting point. However, this can be disabled by setting
-        `from_scratch` to True. In this case, a new TCNN is initialized.
+        Once all query plans have been gathered, the TCNN is trained. By
+        default, the current model weights are used as a starting point.
+        However, this can be disabled by setting `from_scratch` to True. In this
+        case, a new TCNN is initialized.
 
         Note that this method modifies the contents of the experience store.
 
         Parameters
         ----------
         workload: pb.Workload | pd.DataFrame
-            The workload that should be used for calibration. This can either be a set of queries
-            to execute, or a DataFrame containing query plans and runtimes.
+            The workload that should be used for calibration. This can either be
+            a set of queries to execute, or a DataFrame containing query plans
+            and runtimes. If the workload is given as a set of queries, each
+            of those queries will be evaluated on each hint set. This can be
+            modified via `hint_sets` (see below).
         plan_column: str
-            If `workload` is a DataFrame, this column is expected to contain the query
-            plans. If the column does not already contain `pb.QueryPlan` instances, they will be
-            parsed under the assumption that the plans have been generated by the same database
-            system as the target database. Defaults to "query_plan".
+            If `workload` is a DataFrame, this column is expected to contain the
+            query plans. If the column does not already contain `pb.QueryPlan`
+            instances, they will be parsed under the assumption that the plans
+            have been generated by the same database system as the target
+            database. Defaults to "query_plan".
         runtime_column: str
-            If `workload` is a DataFrame, this column is expected to contain the runtimes (in
-            milliseconds) of the query plans. Defaults to "runtime_ms".
+            If `workload` is a DataFrame, this column is expected to contain the
+            runtimes (in milliseconds) of the query plans. Defaults to
+            "runtime_ms".
         timeout_ms: Optional[float]
-            If `workload` is a set of queries, this timeout (in milliseconds) will be applied to
-            each query execution. If a query exceeds this runtime, it will be skipped and not
-            added to the experience.
+            If `workload` is a set of queries, this timeout (in milliseconds)
+            will be applied to each query execution. If a query exceeds this
+            runtime, it will be skipped and not added to the experience.
         from_scratch: bool
-            Whether to start the training with a fresh TCNN model. Defaults to False, which
-            re-uses the current model weights as a starting point.
+            Whether to start the training with a fresh TCNN model. Defaults to
+            False, which re-uses the current model weights as a starting point.
+        hint_sets: Optional[Callable[[str, pb.SqlQuery], Iterable[pb.PhysicalOperatorAssignment]]]
+            If `workload` is a set of queries, this optional callback can be
+            used to specify precisely which hint sets should be evaluated for
+            each query. If no callback is given, all hint sets that are
+            configured on the Bao optimizer will be used. Note that the hint
+            sets returned by the callback can be completely independent from
+            the ones configured on the optimizer.
         """
         if from_scratch:
             self._log("Obtaining new model")
             self._tcnn = BaoModel(self._featurizer.out_shape)
 
         if isinstance(workload, pd.DataFrame):
-            self._retrain_offline(
-                workload, plan_col=plan_column, runtime_col=runtime_column
-            )
+            self._retrain_offline(workload, plan_col=plan_column, runtime_col=runtime_column)
             return
 
         self._log("Gathering query plans for calibration queries")
-        query_iter = (
-            tqdm(workload.queries(), desc="Training query", unit="q")
-            if self._verbose
-            else workload.queries()
-        )
+        query_iter = tqdm(workload.entries(), desc="Training query", unit="q") if self._verbose else workload.entries()
 
         if timeout_ms and not isinstance(self._db, pb.db.TimeoutSupport):
             raise ValueError("Target database system does not provide timeout support.")
 
         if timeout_ms:
             assert isinstance(self._db, pb.db.TimeoutSupport)
-            timeout = 1000 * timeout_ms if timeout_ms else None
-            executor = functools.partial(self._db.execute_with_timeout, timeout=timeout)
+            executor = functools.partial(self._db.execute_with_timeout, timeout=1000 * timeout_ms)
         else:
             executor = functools.partial(self._db.execute_query, raw=True)
 
-        for query in query_iter:
-            query = pb.transform.as_explain_analyze(query)
-            result_set = executor(query)
-            if result_set is None:
-                continue
+        for label, query in query_iter:
+            selected_hint_sets = hint_sets(label, query) if hint_sets else self._hint_sets
 
-            raw_plan = result_set
-            plan = self._db.optimizer().parse_plan(raw_plan, query=query)
-            runtime = plan.execution_time
-            self._experience.add(plan, runtime * 1000)
+            for hint_set in selected_hint_sets:
+                query = self._db.hinting().generate_hints(query, physical_operators=hint_set)
+                query = pb.transform.as_explain_analyze(query)
+
+                result_set = executor(query)
+                if result_set is None:
+                    continue
+
+                raw_plan = result_set
+                plan = self._db.optimizer().parse_plan(raw_plan, query=query)
+                if plan is None:
+                    continue
+
+                runtime_s = plan.execution_time
+                self._experience.add(plan, runtime_s * 1000)
 
         dataset = self._experience.samples()
         loader = torch.utils.data.DataLoader(
@@ -861,9 +856,11 @@ class BaoOptimizer(
         >>> bao = ...
         >>> pb.bench.execute_workload(workload, on=bao, exec_callback=bao.bench_feedback)
         """
-        if result.status != "ok":
+        if result.status != "ok" or result.query_result is None:
             return
         query_plan = self._db.optimizer().parse_plan(result.query_result)
+        if query_plan is None:
+            return
         self.add_experience(query_plan, 1000 * result.execution_time)
 
     def store(self, archive_dir: Path | str) -> Path:
@@ -936,16 +933,12 @@ class BaoOptimizer(
         query: pb.SqlQuery,
         hint_set: pb.PhysicalOperatorAssignment,
         *,
-        join_order: Optional[pb.JoinTree] = None,
+        join_order: pb.JoinTree | None = None,
     ) -> pb.QueryPlan:
-        hinted_query = self._db.hinting().generate_hints(
-            query, join_order=join_order, physical_operators=hint_set
-        )
+        hinted_query = self._db.hinting().generate_hints(query, join_order=join_order, physical_operators=hint_set)
         return self._db.optimizer().query_plan(hinted_query)
 
-    def _retrain_offline(
-        self, samples: pd.DataFrame, *, plan_col: str, runtime_col: str
-    ) -> None:
+    def _retrain_offline(self, samples: pd.DataFrame, *, plan_col: str, runtime_col: str) -> None:
         """Utility to prepare and invoke training based on offline samples."""
         if isinstance(samples[plan_col].iloc[0], pb.QueryPlan):
             plans = samples[plan_col]

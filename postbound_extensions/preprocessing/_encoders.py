@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Optional
+from typing import Self
 
 import numpy as np
 import pandas as pd
@@ -78,19 +78,19 @@ def _build_datetime_encoder(
 class ColumnEncoder[T](ABC):
     @staticmethod
     def online(
-        column: pb.BoundColumnReference,
+        column: pb.ColumnReference,
         *,
         database: pb.Database,
         verbose: bool | pb.util.Logger = False,
     ) -> ColumnEncoder:
         log = wrap_logger(verbose)
+        if not pb.ColumnReference.assert_bound(column):
+            raise pb.UnboundColumnError(column)
 
         datatype = database.schema().datatype(column)
         match datatype.lower():
             case "integer" | "smallint" | "bigint":
-                enc = _build_numeric_encoder(
-                    column, datatype, database=database, log=log
-                )
+                enc = _build_numeric_encoder(column, datatype, database=database, log=log)
             case "character varying" | "varchar" | "text":
                 enc = _build_text_encoder(column, datatype, database=database, log=log)
             case "timestamp without time zone":
@@ -116,9 +116,10 @@ class ColumnEncoder[T](ABC):
 
         return enc
 
-    def __new__(cls, column: pb.BoundColumnReference, dtype: str) -> ColumnEncoder:
-        if cls is not ColumnEncoder:
-            return super().__new__(cls)
+    @staticmethod
+    def initialize(column: pb.ColumnReference, dtype: str) -> ColumnEncoder:
+        if not pb.ColumnReference.assert_bound(column):
+            raise pb.UnboundColumnError(column)
 
         match dtype.lower():
             case "integer" | "smallint" | "bigint":
@@ -130,9 +131,7 @@ class ColumnEncoder[T](ABC):
             case "date":
                 return DateTimeEncoder(column, dtype, date_only=True)
             case _:
-                raise TypeError(
-                    f"Missing encoder for dtype '{dtype}' on column {column.table.full_name}.{column.name}"
-                )
+                raise TypeError(f"Missing encoder for dtype '{dtype}' on column {column.table.full_name}.{column.name}")
 
     def __init__(self, column: pb.BoundColumnReference, dtype: str) -> None:
         self.column = column
@@ -149,7 +148,7 @@ class ColumnEncoder[T](ABC):
     def encode_batch(self, values: Iterable[T]) -> np.ndarray: ...
 
     @abstractmethod
-    def decode(self, vec: np.ndarray) -> Optional[T]: ...
+    def decode(self, vec: np.ndarray) -> T | None: ...
 
     def store(self, target_dir: Path) -> Path:
         if self.values is None:
@@ -182,19 +181,17 @@ class NumericEncoder(ColumnEncoder):
         self._min_val = None
         self._max_val = None
 
-    def fit(
-        self, values: Sequence[int | float], *, prepare_values: bool = True
-    ) -> None:
+    def fit(self, values: Sequence[int | float], *, prepare_values: bool = True) -> None:
         arr = np.array(values).reshape(-1, 1)
         if prepare_values and arr.dtype == "object":
             # if the array is not of object type, it can't contain None values, so we can skip this step
-            arr[arr == None] = np.nan  # noqa: E711
+            arr[arr == None] = np.nan
             arr = arr.astype(float)
         self.values = arr
         self._min_val = np.nanmin(arr)
         self._max_val = np.nanmax(arr)
 
-    def encode_single(self, value: int | float) -> np.ndarray:
+    def encode_single(self, value: float) -> np.ndarray:
         if self._min_val is None or self._max_val is None:
             raise ValueError("Encoder not fitted yet")
         value = np.nan if value is None else value
@@ -208,7 +205,7 @@ class NumericEncoder(ColumnEncoder):
         encoded = (arr - self._min_val) / (self._max_val - self._min_val)
         return encoded
 
-    def decode(self, vec: np.ndarray) -> Optional[int | float]:
+    def decode(self, vec: np.ndarray) -> int | float | None:
         if self._min_val is None or self._max_val is None:
             raise ValueError("Encoder not fitted yet")
         decoded = vec * (self._max_val - self._min_val) + self._min_val
@@ -224,7 +221,7 @@ class TextEncoder(ColumnEncoder):
     def fit(self, values: Sequence[str], *, prepare_values: bool = True) -> None:
         arr = np.array(values, dtype="object")
         if prepare_values:
-            arr[arr == None] = "__POSTBOUND_NULL_PLACEHOLDER__"  # noqa: E711
+            arr[arr == None] = "__POSTBOUND_NULL_PLACEHOLDER__"
         self.values = arr
         self._max_values = len(values)
 
@@ -239,11 +236,11 @@ class TextEncoder(ColumnEncoder):
         if self.values is None:
             raise ValueError("Encoder not fitted yet")
         arr = np.array(values, dtype="object")
-        arr[arr == None] = "__POSTBOUND_NULL_PLACEHOLDER__"  # noqa: E711
+        arr[arr == None] = "__POSTBOUND_NULL_PLACEHOLDER__"
         idxs = np.searchsorted(self.values, arr)
         return (idxs / self._max_values).reshape(-1, 1)
 
-    def decode(self, vec: np.ndarray) -> Optional[str]:
+    def decode(self, vec: np.ndarray) -> str | None:
         if self.values is None:
             raise ValueError("Encoder not fitted yet")
         idx = int(vec[0][0] * self._max_values)
@@ -264,22 +261,16 @@ def _timestamp(value: datetime | date | None) -> float:
 
 
 class DateTimeEncoder(ColumnEncoder):
-    def __new__(
-        cls, column: pb.BoundColumnReference, dtype: str, *, date_only: bool
-    ) -> DateTimeEncoder:
+    def __new__(cls, column: pb.BoundColumnReference, dtype: str, *, date_only: bool) -> Self:
         return super(object).__new__(cls)
 
-    def __init__(
-        self, column: pb.BoundColumnReference, dtype: str, *, date_only: bool
-    ) -> None:
+    def __init__(self, column: pb.BoundColumnReference, dtype: str, *, date_only: bool) -> None:
         super().__init__(column, dtype)
         self.date_only = date_only
         self._min_val = None
         self._max_val = None
 
-    def fit(
-        self, values: Sequence[datetime | date], *, prepare_values: bool = True
-    ) -> None:
+    def fit(self, values: Sequence[datetime | date], *, prepare_values: bool = True) -> None:
         arr = np.array([_timestamp(v) for v in values]).reshape(-1, 1)
         self.values = arr
         self._min_val = np.nanmin(arr)
@@ -299,12 +290,12 @@ class DateTimeEncoder(ColumnEncoder):
         encoded = (arr - self._min_val) / (self._max_val - self._min_val)
         return encoded
 
-    def decode(self, vec: np.ndarray) -> Optional[datetime | date]:
+    def decode(self, vec: np.ndarray) -> datetime | date | None:
         if self._min_val is None or self._max_val is None:
             raise ValueError("Encoder not fitted yet")
         decoded = vec * (self._max_val - self._min_val) + self._min_val
         timestamp = decoded[0][0]
         if np.isnan(timestamp):
             return None
-        dt = datetime.fromtimestamp(timestamp)
+        dt = datetime.fromtimestamp(timestamp)  # noqa -  let's not worry about timezones for now
         return dt.date() if self.date_only else dt
