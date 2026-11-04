@@ -37,7 +37,6 @@ include = ["postbound_extensions*"]
 
 [tool.ty.src]
 exclude = [
-    "postbound_extensions/fastgres/**",
     "postbound_extensions/ceb/**",
     "/**/reference-implementation/**",
 ]
