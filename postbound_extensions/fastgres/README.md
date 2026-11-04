@@ -1,155 +1,97 @@
-# SafeBound
+# FASTgres with FASTlabel
 
-- **Original Paper:** _SafeBound: A Practical System for Generating Cardinality
-  Bounds_
-- **Authors:** Kyle Deeds, Dan Suciu, and Magdalena Balazinska
-- **Published:** SIGMOD 2023
-- **Link:** <https://doi.org/10.1145/3588907>
-- **Reference Implementation:** <https://github.com/kylebd99/SafeBound>
+This module brings learned optimizer hinting to PostgreSQL through
+[PostBOUND](https://github.com/rbergm/PostBOUND). It combines **FASTgres** for
+predicting useful hint sets with **FASTlabel** for producing the training labels.
+PostgreSQL uses those hints to choose and execute a query plan.
 
-SafeBound is an upper bound-based cardinality estimator (i.e. a "pessimistic
-optimizer") that uses degree sequences on join columns to calculate upper bounds
-on the size of intermediate results.
-To keep estimation and storage overhead manageable, SafeBound compresses degree
-sequences to short piecewise constant functions. It supports conditioning the
-degree sequences on join columns by pre-computing filter predicates.
+**This is an adapted and modernized implementation of both approaches**, developed
+for the Optimizer Playground. It retains their central ideas while updating the
+interfaces, query handling, and persistence for PostBOUND.
 
-We implement SafeBound completely from scratch based on the original paper. Under
-the hood we use numpy to accelerate computations.
+## How it works
 
+A hint set is a combination of PostgreSQL planner switches, such as allowing or
+discouraging hash joins, nested-loop joins, or index scans. Different queries can
+benefit from different combinations.
 
-## High-level Interface
+FASTlabel searches promising combinations and measures their execution times. The
+best observed combination becomes the query's training label. FASTgres then learns
+to predict these labels from query features, using gradient boosting models for
+groups of related queries called *contexts*.
 
-SafeBound implements the PostBOUND [`CardinalityEstimator`](https://postbound.readthedocs.io/en/latest/api/core/optimization-pipelines.html#postbound.CardinalityEstimator)
-interface. The `SafeBoundEstimator` acts as the central entrypoint. It requires
-a `SafeBoundCatalog` to function correctly. This catalog stores all individual
-(conditioned and unconditioned) piecewise constant functions. A catalog can be
-created either based on a workload, or inferred completely from the database.
-See its documentation for more details.
+The workflow has four steps:
 
-In addition to catalog and estimator, the following functions capture important
-concepts of the original paper:
+1. **Label a workload.** Run the adapted FASTlabel search, or reuse existing labels.
+2. **Prepare query features.** Collect database statistics and encode query filters.
+3. **Train FASTgres.** Group queries into contexts and learn a hint predictor for
+   each context.
+4. **Optimize queries.** Predict a hint set and let PostgreSQL plan the query using
+   those settings.
 
-- `DegreeSequence` and `PiecewiseConstantFunction` model the core data structures.
-- `decompose_acyclic()` implements the query decomposition logic (see below).
-- `valid_compress()` implements the compression algorithm from the paper to
-  transform a degree sequence into a piecewise constant function.
-- `fdsb()` computes the upper bound for a query, given its decomposition as well
-  as the relevant PCFs (typically retrieved from the catalog).
+## This adaptation
 
+The implementation brings the two approaches into a shared PostBOUND workflow:
 
-## Storing SafeBound Catalogs
+- Query parsing and database interaction use the PostBOUND 0.23 APIs.
+- Encoding statistics and CSV labels can be reused; trained models can be saved
+  and loaded for later prediction.
+- Versioned hint catalogs cover PostgreSQL 12 through 19, including their declared
+  JIT defaults.
 
-Since computing an entire SafeBound catalog from scratch involves issuing a large
-number of (somewhat complex) SQL queries, it is quite time consuming and we do
-not recommend doing it online.
-Instead, an existing catalog can be persisted as a JSON object using the `store()`
-method.
-Afterwards, the `SafeBoundCatalog.load()` method allows to re-create the catalog.
+The current PostBOUND operator-selection adapter supports the **six core scan and
+join hints**. The additional hints in the versioned catalogs require further
+integration with that adapter.
 
-The generally recommended pattern is to use `SafeBoundCatalog.load_or_build()`.
-It checks, whether a catalog has been persisted at the given location. If it has,
-it will be loaded. Otherwise, the catalog is created and stored.
+## Where to start
 
+[`FastgresOptimizer`](_optimizer.py) is the public entry point. It defaults to one
+supertable model over the tables in the preparation workload. Training subsets and
+new queries use that same context and feature layout. A query outside the trained
+contexts emits `FastgresContextWarning` and receives the PostgreSQL defaults
+declared by the selected hint library.
 
-## Example
+```python
+from postbound_extensions.fastgres import FastgresOptimizer
 
-```py
-#
-# Step 1: generic setup
-#
-# As usual for PostBOUND, connect to our target database and load the workload
-import postbound as pb
-import postbound_extensions as pbx
+# pg, encoding_workload, training_workload, and query are PostBOUND objects.
+optimizer = FastgresOptimizer(database=pg)
+optimizer.prepare(encoding_workload, encodings="postbound_extensions/fastgres/generated/imdb")
+optimizer.train(training_workload, labels="postbound_extensions/fastgres/generated/imdb/labels/label.csv")
+hints = optimizer.predict(query)  # HintSet: inspect dict(hints) or hints.int_rep
+plan = optimizer.optimize_query(query)
 
-pg_instance = pb.postgres.connect(config_file=".pg-connect-stats.toml")
-stats = pb.workloads.stats()
-
-
-#
-# Step 2: build our catalog
-#
-# We use the same "hyperparameters" (mcv size, histogram depth, etc.)
-# as the original papers
-safebound_spec = pbx.safebound.SafeBoundSpec.default()
-
-# If no catalog exists, build a new one fine-tuned for the workload
-# otherwise, reload the existing catalog
-cat = pbx.safebound.SafeBoundCatalog.load_or_build(
-    "models/safebound/stats", database=pg_instance, workload=stats, spec=safebound_spec
-)
-
-
-#
-# Step 3: create the actual estimator
-#
-safebound = pbx.safebound.SafeBoundEstimator(cat)
-
-
-#
-# Step 4: Evaluation
-#
-# We can already use this optimizer to calculate the bound of different queries:
-query = stats["q-10"]
-print(safebound.calculate_estimate(query, query.tables()))
-
-# Or we can run the PostBOUND benchmarking utilities
-pb.bench.execute_workload(
-    stats,
-    on=safebound,
-    query_preparation={"analyze": True, "prewarm": True},
-    name="safebound-test",
-    progressive_output="safebound-benchmark.parquet",
-    logger="tqdm"
-)
+catalog = optimizer.store("models/fastgres")  # New or empty directory
+restored = FastgresOptimizer.pre_trained(catalog)  # Prediction needs no label CSV or database
 ```
 
+Preparation collects statistics only when cached encodings are omitted. Labeling
+is a separate, explicit call to `optimizer.label(workload)`; its returned DataFrame
+can be passed to `train`. `load_or_build` loads an existing bundle or prepares,
+trains, and stores one using supplied labels. Bundles include the encodings,
+contexts, models, and ordered hint definitions.
 
-## Deviations from the Original Paper
-
-The SafeBound implementation contains a faithful adaptation of the following features:
-
-- Compression of degree sequences to piecewise constant functions
-- Computation of the upper bound using alpha steps and beta steps
-- Correlated degree sequences for equality predicates based on most-common values
-- Correlated degree sequences for range predicates using hierarchies of histograms
-- Correlated degree sequences for LIKE predicates based on most-common values
-
-To get a running implementation of SafeBound, we developed our own query decomposition
-algorithm, since the original paper did not contain any information on how to do
-that.
-See the documentation of `decompose_acyclic` for a detailed rundown of the algorithm.
-
-We also added support for half-open range predicates. See the documentation of `RangeConditionedPCF`
-for details.
-
-At the same time, we currently do not support the following:
-
-- Variable MCV sizes and histogram depths
-- Optimizations (Section 4 of the paper), including
-  - Degree sequences on pre-computed primary key/foreign key joins
-  - Group compression of PCFs
-  - Bloom filters on MCV lists
-
-While group compression and bloom filtering "only" improve the resource consumption
-of SafeBound, pre-computed primary key/foreign key joins also increase the
-accuracy. We do not implement the first two because minimizing the resource
-consumption is currently not a primary goal of our implementation. Materializing
-primary key/foreign key joins is not implemented because this essentially constitutes
-a materialized view, which is an orthogonal optimization which is best treated
-at the schema level.
-
-
-## Authors and License
-
-This implementation of SafeBound has been contributed by Rico Bergmann. It is
-provided as part of the [Optimizer Collection project](https://github.com/Optimizer-Playground/Optimization-Techniques)
-and licensed under the same conditions.
-
+The individual stages are available in [labeling](labeling/),
+[featurization](featurization/), [context](context/), and [model](model/).
 
 ## References
 
-Kyle Deeds et al.: _SafeBound: A Practical System for Generating Cardinality Bounds_
-(SIGMOD 2023); DOI [10.1145/3588907](https://doi.org/10.1145/3588907)
+- **FASTgres:** Woltmann, L.; Thiessat, J.; Hartmann, C.; Habich, D.; Lehner, W.
+  *FASTgres: Making Learned Query Optimizer Hinting Effective.*
+  Proceedings of the VLDB Endowment, 16(11), 3310-3322, 2023.
+  [Paper](https://doi.org/10.14778/3611479.3611528) |
+  [Original implementation](https://github.com/db-tu-dresden/FASTgres-PVLDBv16)
+- **FASTlabel:** Thiessat, K.; Habich, D.; Lehner, W.
+  *FASTlabel: Making Supervised Query Optimizer Hinting Practical.*
+  BTW 2025, 241-264.
+  [Paper](https://doi.org/10.18420/BTW2025-11) |
+  [Original implementation](https://github.com/db-tu-dresden/BTW25-FASTLabel)
 
-Reference implementation: <https://github.com/kylebd99/SafeBound>
+When using this adaptation in research, please cite both underlying approaches
+and identify the version of this repository used in your experiments.
+
+## Attribution and license
+
+This adaptation is contributed by Kira Thiessat as part of the
+[Optimizer Playground](https://github.com/Optimizer-Playground/Optimization-Techniques).
+See the repository [license](../../LICENSE) for licensing terms.
