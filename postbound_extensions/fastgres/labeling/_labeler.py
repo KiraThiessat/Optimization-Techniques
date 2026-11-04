@@ -79,8 +79,8 @@ class WorkloadLabelSettings:
 
         self.fls = label_settings
 
-        self.workload = pb.Workload.read(self._query_path)
         self.dbc = pb.postgres.connect(application_name="FastLabel", connect_string=db_string)
+        self.workload = pb.Workload.read(self._query_path)
         self.plan_params = no_geqo()
         self.qex = QueryExecutor(self.dbc, plan_params=no_geqo())
         self.hsf = HintSetFactory(CORE_HINT_LIBRARY)

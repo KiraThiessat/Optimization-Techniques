@@ -1,4 +1,5 @@
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,7 @@ class FastgresModel:
 
     def __init__(self, **gb_kwargs):
         self._live_model: GradientBoostingClassifier = GradientBoostingClassifier(**gb_kwargs)
-        self._onnx_model: Optional[onnx.ModelProto] = None
+        self._onnx_model: onnx.ModelProto | None = None
 
     def fit(self, x, y):
         if self._onnx_model is not None:
